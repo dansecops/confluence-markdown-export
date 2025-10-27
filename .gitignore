@@ -1,0 +1,6 @@
+# Confluence credentials - DO NOT COMMIT
+confluence_env.sh
+
+# Exported files
+confluence-export/
+
