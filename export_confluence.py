@@ -10,19 +10,15 @@ recursive export of page hierarchies. It uses only Python standard library
 and requires Confluence API credentials.
 """
 
-import urllib.request
-import urllib.error
-import json
 import sys
 import re
-import base64
 import os
 import argparse
 
-# Global variables for configuration (set via arguments or env vars)
-CONFLUENCE_BASE_URL = None
-USERNAME = None
-API_TOKEN = None
+# Import our new modules
+from config import ConfluenceConfig, ConfigurationError
+from auth import ConfluenceAuth
+from api_client import ConfluenceClient, ConfluenceAPIError
 
 def html_to_markdown(html):
     """Convert HTML to Markdown (basic conversion)"""
@@ -61,45 +57,6 @@ def html_to_markdown(html):
     
     return text.strip()
 
-def get_page(page_id):
-    """Get a Confluence page by ID"""
-    url = f"{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}?expand=body.view,space"
-    
-    # Create auth header
-    credentials = f"{USERNAME}:{API_TOKEN}"
-    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
-    
-    req = urllib.request.Request(url)
-    req.add_header('Authorization', f'Basic {encoded_credentials}')
-    req.add_header('Content-Type', 'application/json')
-    
-    try:
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        print(f"Error: {e.code}", file=sys.stderr)
-        print(e.read().decode('utf-8'), file=sys.stderr)
-        sys.exit(1)
-
-def get_child_pages(page_id):
-    """Get all child pages of a given page"""
-    url = f"{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}/child/page"
-    
-    # Create auth header
-    credentials = f"{USERNAME}:{API_TOKEN}"
-    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
-    
-    req = urllib.request.Request(url)
-    req.add_header('Authorization', f'Basic {encoded_credentials}')
-    req.add_header('Content-Type', 'application/json')
-    
-    try:
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            return data.get('results', [])
-    except urllib.error.HTTPError as e:
-        print(f"Error getting children: {e.code}", file=sys.stderr)
-        return []
 
 def sanitize_filename(filename):
     """Sanitize filename for safe file creation"""
@@ -112,9 +69,19 @@ def sanitize_filename(filename):
         filename = filename[:200]
     return filename
 
-def export_page_to_markdown(page_id, output_file=None):
-    """Export a Confluence page to Markdown"""
-    page_data = get_page(page_id)
+def export_page_to_markdown(client, page_id, output_file=None):
+    """
+    Export a Confluence page to Markdown.
+    
+    Args:
+        client: ConfluenceClient instance
+        page_id: Confluence page ID
+        output_file: Optional output file path
+        
+    Returns:
+        The markdown content as a string
+    """
+    page_data = client.get_page(page_id)
     
     title = page_data['title']
     html_content = page_data['body']['view']['value']
@@ -132,16 +99,23 @@ def export_page_to_markdown(page_id, output_file=None):
     
     return output
 
-def export_page_with_children(page_id, output_dir, depth=0, max_depth=10):
-    """Recursively export a page and all its children"""
-    import os
+def export_page_with_children(client, page_id, output_dir, depth=0, max_depth=10):
+    """
+    Recursively export a page and all its children.
     
+    Args:
+        client: ConfluenceClient instance
+        page_id: Confluence page ID
+        output_dir: Output directory for exported files
+        depth: Current recursion depth
+        max_depth: Maximum recursion depth
+    """
     if depth > max_depth:
         print(f"⚠️  Max depth reached, skipping further children", file=sys.stderr)
         return
     
     # Get page data
-    page_data = get_page(page_id)
+    page_data = client.get_page(page_id)
     title = page_data['title']
     
     # Create output filename
@@ -151,10 +125,10 @@ def export_page_with_children(page_id, output_dir, depth=0, max_depth=10):
     # Export the page
     indent = "  " * depth
     print(f"{indent}📄 Exporting: {title}")
-    export_page_to_markdown(page_id, output_file)
+    export_page_to_markdown(client, page_id, output_file)
     
     # Get and export children
-    children = get_child_pages(page_id)
+    children = client.get_child_pages(page_id)
     if children:
         print(f"{indent}   └─ Found {len(children)} child page(s)")
         
@@ -164,27 +138,30 @@ def export_page_with_children(page_id, output_dir, depth=0, max_depth=10):
         
         for child in children:
             child_id = child['id']
-            export_page_with_children(child_id, child_dir, depth + 1, max_depth)
+            export_page_with_children(client, child_id, child_dir, depth + 1, max_depth)
 
 if __name__ == "__main__":
-    import os
-    
     parser = argparse.ArgumentParser(
         description='Export Confluence pages to Markdown format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Export a single page
-  python3 export_confluence.py 123456 -u user@example.com -t TOKEN -b https://company.atlassian.net/wiki
+  # Export a single page (requires .env file or environment variables)
+  python3 export_confluence.py 123456 output.md
   
   # Export a page with all children
-  python3 export_confluence.py 123456 --with-children -u user@example.com -t TOKEN -b https://company.atlassian.net/wiki
+  python3 export_confluence.py 123456 output_dir --with-children
   
-  # Use environment variables
-  export CONFLUENCE_USERNAME="user@example.com"
-  export CONFLUENCE_API_TOKEN="your-token"
-  export CONFLUENCE_BASE_URL="https://company.atlassian.net/wiki"
-  python3 export_confluence.py 123456 --with-children
+  # Limit recursion depth
+  python3 export_confluence.py 123456 output_dir --with-children --max-depth 5
+
+Configuration:
+  Credentials are loaded from .env file or environment variables:
+    CONFLUENCE_USERNAME - Your Confluence username (email)
+    CONFLUENCE_API_TOKEN - Your Confluence API token
+    CONFLUENCE_BASE_URL - Your Confluence base URL (e.g., https://company.atlassian.net/wiki)
+  
+  See README.md for setup instructions.
         """
     )
     
@@ -192,57 +169,53 @@ Examples:
     parser.add_argument('output', nargs='?', default=None,
                        help='Output file (single page) or directory (with children)')
     
-    parser.add_argument('-u', '--username', 
-                       help='Confluence username (email). Can also use CONFLUENCE_USERNAME env var')
-    parser.add_argument('-t', '--token', '--api-token',
-                       help='Confluence API token. Can also use CONFLUENCE_API_TOKEN env var')
-    parser.add_argument('-b', '--base-url', '--url',
-                       help='Confluence base URL (e.g., https://company.atlassian.net/wiki). Can also use CONFLUENCE_BASE_URL env var')
-    
     parser.add_argument('--with-children', action='store_true',
                        help='Export the page and all its descendant pages recursively')
     parser.add_argument('--max-depth', type=int, default=10,
                        help='Maximum depth for recursive export (default: 10)')
+    parser.add_argument('--env-file', default='.env',
+                       help='Path to .env file (default: .env)')
     
     args = parser.parse_args()
     
-    # Set configuration from arguments or environment variables
-    CONFLUENCE_BASE_URL = args.base_url or os.getenv('CONFLUENCE_BASE_URL')
-    USERNAME = args.username or os.getenv('CONFLUENCE_USERNAME')
-    API_TOKEN = args.token or os.getenv('CONFLUENCE_API_TOKEN')
-    
-    # Validate required parameters
-    if not USERNAME:
-        print("❌ Error: Username is required. Use -u/--username or set CONFLUENCE_USERNAME environment variable", file=sys.stderr)
-        sys.exit(1)
-    if not API_TOKEN:
-        print("❌ Error: API token is required. Use -t/--token or set CONFLUENCE_API_TOKEN environment variable", file=sys.stderr)
-        sys.exit(1)
-    if not CONFLUENCE_BASE_URL:
-        print("❌ Error: Confluence base URL is required. Use -b/--base-url or set CONFLUENCE_BASE_URL environment variable", file=sys.stderr)
+    # Load configuration
+    try:
+        config = ConfluenceConfig(env_file=args.env_file)
+    except ConfigurationError as e:
+        print(f"❌ Configuration Error:\n{e}", file=sys.stderr)
+        print("\nPlease create a .env file or set environment variables.", file=sys.stderr)
+        print("See README.md for setup instructions.", file=sys.stderr)
         sys.exit(1)
     
-    # Remove trailing slashes from base URL
-    CONFLUENCE_BASE_URL = CONFLUENCE_BASE_URL.rstrip('/')
+    # Initialize authentication and API client
+    auth = ConfluenceAuth(config)
+    client = ConfluenceClient(config, auth)
     
     page_id = args.page_id
     
-    if args.with_children:
-        # Export with children
-        output_dir = args.output if args.output else 'confluence-export'
-        os.makedirs(output_dir, exist_ok=True)
-        
-        print(f"🚀 Starting export of page {page_id} and all children...")
-        print(f"📁 Output directory: {output_dir}")
-        print(f"🔐 Connecting to: {CONFLUENCE_BASE_URL}")
-        print(f"👤 Username: {USERNAME}")
-        print("")
-        
-        export_page_with_children(page_id, output_dir, max_depth=args.max_depth)
-        
-        print("")
-        print(f"✨ Export complete! Check {output_dir}/")
-    else:
-        # Single page export
-        output_file = args.output
-        export_page_to_markdown(page_id, output_file)
+    try:
+        if args.with_children:
+            # Export with children
+            output_dir = args.output if args.output else 'confluence-export'
+            os.makedirs(output_dir, exist_ok=True)
+            
+            print(f"🚀 Starting export of page {page_id} and all children...")
+            print(f"📁 Output directory: {output_dir}")
+            print(f"🔐 Connecting to: {config.base_url}")
+            print(f"👤 Username: {config.username}")
+            print("")
+            
+            export_page_with_children(client, page_id, output_dir, max_depth=args.max_depth)
+            
+            print("")
+            print(f"✨ Export complete! Check {output_dir}/")
+        else:
+            # Single page export
+            output_file = args.output
+            export_page_to_markdown(client, page_id, output_file)
+    except ConfluenceAPIError as e:
+        print(f"\n❌ Export failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Export interrupted by user", file=sys.stderr)
+        sys.exit(130)
